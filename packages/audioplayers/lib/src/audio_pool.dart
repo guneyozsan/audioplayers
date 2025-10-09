@@ -19,7 +19,7 @@ class AudioPool {
   @visibleForTesting
   final Map<String, AudioPlayer> currentPlayers = {};
   @visibleForTesting
-  final List<AudioPlayer> availablePlayers = [];
+  final Set<AudioPlayer> availablePlayers = {};
 
   /// Instance of [AudioCache] to be used by all players.
   final AudioCache audioCache;
@@ -40,6 +40,8 @@ class AudioPool {
   /// [AudioPlayer]s created, but once they are stopped they will not be
   /// returned to the pool.
   final int maxPlayers;
+
+  Duration? _duration;
 
   final Lock _lock = Lock();
 
@@ -67,12 +69,13 @@ class AudioPool {
       audioContext: audioContext,
     );
 
-    final players = <AudioPlayer>[];
+    final createFutures = <Future<AudioPlayer>>[];
 
     for (var i = 0; i < minPlayers; i++) {
-      players.add(await instance._createNewAudioPlayer());
+      createFutures.add(instance._createNewAudioPlayer());
     }
 
+    final players = await Future.wait(createFutures);
     return instance..availablePlayers.addAll(players);
   }
 
@@ -94,10 +97,9 @@ class AudioPool {
   /// Starts playing the audio, returns a function that can stop the audio.
   Future<StopFunction> start({double volume = 1.0}) async {
     return _lock.synchronized(() async {
-      if (availablePlayers.isEmpty) {
-        availablePlayers.add(await _createNewAudioPlayer());
-      }
-      final player = availablePlayers.removeAt(0);
+      final player = availablePlayers.isEmpty
+          ? await _createNewAudioPlayer()
+          : _grabAnAvailablePlayer();
       currentPlayers[player.playerId] = player;
       await player.setVolume(volume);
       await player.resume();
@@ -111,7 +113,7 @@ class AudioPool {
             subscription.cancel();
             await removedPlayer.stop();
             if (availablePlayers.length >= maxPlayers) {
-              await removedPlayer.release();
+              await removedPlayer.dispose();
             } else {
               availablePlayers.add(removedPlayer);
             }
@@ -125,6 +127,29 @@ class AudioPool {
     });
   }
 
+  Future<Duration?> getDuration() async {
+    if (_duration != null) return _duration;
+
+    return _lock.synchronized(() async {
+      final player = availablePlayers.isEmpty
+          ? await _createNewAudioPlayer()
+          : _grabAnAvailablePlayer();
+      currentPlayers[player.playerId] = player;
+      _duration = await player.getDuration();
+
+      final removedPlayer = currentPlayers.remove(player.playerId);
+      if (removedPlayer != null) {
+        if (availablePlayers.length >= maxPlayers) {
+          await removedPlayer.dispose();
+        } else {
+          availablePlayers.add(removedPlayer);
+        }
+      }
+
+      return _duration;
+    });
+  }
+
   Future<AudioPlayer> _createNewAudioPlayer() async {
     final player = AudioPlayer()..audioCache = audioCache;
     if (audioContext != null) {
@@ -132,6 +157,18 @@ class AudioPool {
     }
     await player.setSource(source);
     await player.setReleaseMode(ReleaseMode.stop);
+    return player;
+  }
+
+  AudioPlayer _grabAnAvailablePlayer() {
+    assert(
+      availablePlayers.isNotEmpty,
+      'Check if availablePlayers is empty '
+      'before calling this method. This is not inlined to prevent '
+      'unnecessary async calls.',
+    );
+    final player = availablePlayers.first;
+    availablePlayers.remove(player);
     return player;
   }
 
